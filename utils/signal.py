@@ -13,6 +13,13 @@ def moving_average(x, w):
     return np.convolve(x, np.ones(w) / w, mode='same')
 
 
+def adaptive_smoothing_window(slot_delay, dt_bin, maximum=40):
+    """Keep smoothing below one third of the inter-slot time."""
+    if dt_bin <= 0:
+        raise ValueError("dt_bin must be positive")
+    return max(1, min(int(maximum), int(float(slot_delay) / (3.0 * float(dt_bin)))))
+
+
 def load_experiment_data(exp_path, normalization=1):
     """
     Load a single Exp_xxx.csv template and optionally bin the data.

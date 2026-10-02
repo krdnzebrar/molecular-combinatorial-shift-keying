@@ -8,7 +8,7 @@ Monte-Carlo SER/BER vs Ts sweep across the 4 MoCSK-family schemes:
   4. Sparse pattern with fixed threshold and molecule exclusion
 
 Features:
-  - N_Tx sweep ([500, 1000] by default) wired to per-N cached experiment templates.
+  - N_Tx sweep (100, 200, ..., 1000 by default) wired to per-N cached templates.
   - Pooled Wilson 95% confidence intervals across all trials per point.
   - Zero-error safe: displays 95% upper bound markers (0/n) instead of dropping or NaN on log plots.
   - Generates publication-ready figures saved in results/figures/.
@@ -17,9 +17,11 @@ Features:
 import os
 import sys
 import math
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
+from matplotlib.backends.backend_pdf import PdfPages
 
 # Ensure repository root is on sys.path
 PROJECT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -52,13 +54,220 @@ _SCHEME_COLORS = {
 
 _SCHEME_LABELS = {
     "permutation": "Permutation",
-    "combo_fixed": "Combination (fixed thr.)",
-    "combo_adaptive": "Combination (adaptive thr.)",
-    "sparse": "Sparse",
+    "combo_fixed": "MoCSK (unlabeled fixed threshold)",
+    "combo_adaptive": "MoCSK (adaptive ratio threshold)",
+    "sparse": "E-MoCSK (slot selection)",
 }
 
 _LINE_STYLES = ["-", "--", ":", "-."]
 _MARKERS = ["o", "s", "^", "D", "v"]
+
+
+def information_bits_per_symbol(scheme, num_molecule_types):
+    """Return log2 of the scheme's nominal alphabet size."""
+    k = int(num_molecule_types)
+    if scheme == "permutation":
+        log2_m = math.lgamma(k + 1) / math.log(2)
+    elif scheme in ("combo_fixed", "combo_adaptive"):
+        alphabet_size = sum(math.factorial(k) // math.factorial(k - j)
+                            for j in range(k + 1))
+        log2_m = math.log2(alphabet_size)
+    elif scheme == "sparse":
+        # E-MoCSK: includes k=0 (the all-empty symbol).
+        alphabet_size = sum(math.comb(k, j) ** 2 * math.factorial(j) for j in range(k + 1))
+        log2_m = math.log2(alphabet_size)
+    else:
+        raise ValueError(f"Unknown scheme: {scheme}")
+    return log2_m
+
+
+def slot_delay_for_symbol(ts, num_molecule_types):
+    """Use a uniform release grid, including across consecutive symbol boundaries."""
+    k = int(num_molecule_types)
+    if k <= 1:
+        return min(float(max_delay), float(ts))
+    # Keeping Δ=Ts/K makes the gap from the last slot of one active symbol
+    # to the first slot of the next consecutive symbol equal to every other gap.
+    return float(ts) / k
+
+
+def _save_sweep_csv(path, rows):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    columns = ["sweep", "scheme", "num_molecule_types", "n_tx", "ts", "errors",
+               "total_symbols", "ser", "ser_ci_low", "ser_ci_high",
+               "bits_per_symbol", "goodput_bits_per_second"]
+    with open(path, "w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _summarize_point(scheme, k, n_tx, counts, sweep):
+    rows = []
+    for idx, (errors, total) in enumerate(zip(counts["errors"], counts["totals"])):
+        ser, low, high = wilson_ci(int(errors), int(total))
+        bps = information_bits_per_symbol(scheme, k)
+        ts = float(counts["ts"][idx])
+        rows.append({
+            "sweep": sweep, "scheme": scheme, "num_molecule_types": k,
+            "n_tx": n_tx, "ts": ts, "errors": int(errors),
+            "total_symbols": int(total), "ser": ser, "ser_ci_low": low,
+            "ser_ci_high": high, "bits_per_symbol": bps,
+            "goodput_bits_per_second": (1.0 - ser) * bps / ts if total else float("nan"),
+        })
+    return rows
+
+
+def run_requested_sweeps(
+    *, schemes=None, molecule_type_counts=range(2, 11), n_tx_values=range(100, 1001, 100),
+    seq_length=100, num_trials=10, n_exp_templates=100, exp_root=None,
+    delay_between_molecules=None, rng_seed=42, ts_sweep_n_tx=500,
+    ts_values=None,
+    template_method="brownian",
+    generate_templates=True,
+    results_dir=None,
+):
+    """Run the Ts and N_Tx sweeps, save PDF plots and a combined CSV."""
+    if schemes is None:
+        schemes = ["permutation", "combo_fixed", "combo_adaptive", "sparse"]
+    ks = [int(k) for k in molecule_type_counts]
+    nts = [int(n) for n in n_tx_values]
+    if ts_values is None:
+        ts_values = np.round(np.arange(0.2, 1.0 + 1e-9, 0.1), 1).tolist()
+    else:
+        ts_values = [float(ts) for ts in ts_values]
+    if not ks or any(k < 1 for k in ks):
+        raise ValueError("molecule_type_counts must contain positive integers")
+    if not nts or any(n < 1 for n in nts):
+        raise ValueError("n_tx_values must contain positive integers")
+    if not ts_values or any(ts <= 0 for ts in ts_values):
+        raise ValueError("ts_values must contain positive values")
+    results_dir = results_dir or os.path.join(PROJECT_DIR, "results")
+    figures_dir = os.path.join(results_dir, "figures")
+    os.makedirs(figures_dir, exist_ok=True)
+    rows = []
+
+    # Ts sweep: one curve per K and method, with N_Tx fixed.
+    ts_data = {}
+    fixed_n_tx = int(ts_sweep_n_tx)
+    for scheme in schemes:
+        ts_data[scheme] = {}
+        for k in ks:
+            ts_data[scheme][k] = sweep_ts_pooled(
+                scheme, ts_values, fixed_n_tx, num_molecule_types=k,
+                seq_length=seq_length, num_trials=num_trials, exp_root=exp_root,
+                n_exp_templates=n_exp_templates, delay_between_molecules=delay_between_molecules,
+                rng_seed=rng_seed, mode="ser", generate_templates=generate_templates,
+                template_method=template_method)
+            rows.extend(_summarize_point(scheme, k, fixed_n_tx, ts_data[scheme][k], "ts"))
+
+    # N_Tx sweep: one curve per K and method, at its minimum Ts=1/K.
+    ntx_data = {}
+    for scheme in schemes:
+        ntx_data[scheme] = {}
+        for k in ks:
+            ntx_data[scheme][k] = {}
+            for n_tx in nts:
+                counts = sweep_ts_pooled(
+                    scheme, [1.0 / k], n_tx, num_molecule_types=k,
+                    seq_length=seq_length, num_trials=num_trials, exp_root=exp_root,
+                    n_exp_templates=n_exp_templates, delay_between_molecules=delay_between_molecules,
+                    rng_seed=rng_seed, mode="ser", generate_templates=generate_templates,
+                    template_method=template_method)
+                ntx_data[scheme][k][n_tx] = counts
+                rows.extend(_summarize_point(scheme, k, n_tx, counts, "n_tx"))
+
+    _plot_metric_families(ts_data, ks, schemes, "ts", os.path.join(figures_dir, "ser_goodput_vs_ts.pdf"), fixed_n_tx)
+    _plot_metric_families(ntx_data, ks, schemes, "n_tx", os.path.join(figures_dir, "ser_goodput_vs_n_tx.pdf"), None)
+    _save_sweep_csv(os.path.join(results_dir, "sweep_results.csv"), rows)
+    print(f"Saved figures and pooled results under: {results_dir}")
+    return {"ts": ts_data, "n_tx": ntx_data, "rows": rows}
+
+
+def _plot_metric_families(data, ks, schemes, x_kind, path, fixed_n_tx):
+    """Write a two-page PDF with one small multiple per K on each page."""
+    ncols = min(3, len(ks))
+    nrows = int(math.ceil(len(ks) / ncols))
+    xlabel = "Symbol period $T_s$ (s)" if x_kind == "ts" else "$N_{\\rm Tx}$ molecules"
+    if x_kind == "ts":
+        condition = f"$N_{{\\rm Tx}}={fixed_n_tx}$"
+    else:
+        condition = "$T_s=1/K$ s for each K"
+
+    with PdfPages(path) as pdf:
+        for metric in ("ser", "goodput"):
+            fig, axes = plt.subplots(
+                nrows, ncols, figsize=(5.2 * ncols, 3.6 * nrows), squeeze=False
+            )
+            plotted_handles = {}
+            for facet_idx, k in enumerate(ks):
+                ax = axes.flat[facet_idx]
+                for scheme in schemes:
+                    if scheme not in data or k not in data[scheme]:
+                        continue
+                    if x_kind == "ts":
+                        counts = data[scheme][k]
+                        points = [
+                            (float(ts), counts, idx)
+                            for idx, ts in enumerate(counts["ts"])
+                        ]
+                    else:
+                        points = [
+                            (float(n_tx), data[scheme][k][n_tx], 0)
+                            for n_tx in sorted(data[scheme][k])
+                        ]
+
+                    xs, ys = [], []
+                    for x, counts, idx in points:
+                        errors = int(counts["errors"][idx])
+                        total = int(counts["totals"][idx])
+                        # Failed/missing points must not appear as zero-error results.
+                        if total <= 0:
+                            continue
+                        ser, _, ci_high = wilson_ci(errors, total)
+                        ts = float(counts["ts"][idx])
+                        y = (ser if ser > 0 else ci_high) if metric == "ser" else (
+                            (1.0 - ser) * information_bits_per_symbol(scheme, k) / ts
+                        )
+                        xs.append(x)
+                        ys.append(y)
+
+                    if not xs:
+                        continue
+                    line, = ax.plot(
+                        xs, ys, marker="o", markersize=3.5, linewidth=1.35,
+                        label=_SCHEME_LABELS.get(scheme, scheme),
+                        color=_SCHEME_COLORS.get(scheme, "black"),
+                    )
+                    plotted_handles.setdefault(scheme, line)
+
+                ax.set_title(f"K={k}")
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel(
+                    "SER (zero-error points show 95% upper bound)"
+                    if metric == "ser" else "SER-based goodput (bits/s)"
+                )
+                if metric == "ser":
+                    ax.set_yscale("log")
+                ax.grid(True, which="both", alpha=0.3)
+
+            for idx in range(len(ks), nrows * ncols):
+                axes.flat[idx].set_visible(False)
+
+            title_metric = "SER" if metric == "ser" else "SER-based goodput"
+            x_label = "$T_s$" if x_kind == "ts" else "$N_{\\rm Tx}$"
+            fig.suptitle(f"{title_metric} vs {x_label} ({condition})", y=0.995)
+            if plotted_handles:
+                fig.legend(
+                    list(plotted_handles.values()),
+                    [_SCHEME_LABELS.get(s, s) for s in plotted_handles],
+                    loc="upper center", bbox_to_anchor=(0.5, 0.965),
+                    ncol=min(4, len(plotted_handles)), fontsize=8,
+                )
+            fig.tight_layout(rect=(0, 0, 1, 0.92))
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+    print(f"Figure saved -> {path}")
 
 
 def _single_trial_counts(
@@ -74,7 +283,7 @@ def _single_trial_counts(
 ):
     """
     Run one trial of a given scheme and return (errors, total_units).
-    For 'ser', units = number of '1' symbols transmitted.
+    For 'ser', units = number of modulation symbols transmitted.
     For 'ber', units = len(bit_sequence).
     """
     runner = SCHEME_RUNNERS.get(scheme)
@@ -128,44 +337,68 @@ def sweep_ts_pooled(
     exp_root=None,
     n_exp_templates=100,
     normalization=NORMALIZATION,
-    delay_between_molecules=0.4,
+    delay_between_molecules=None,
     device=None,
     rng_seed=None,
     mode="ser",
     min_informative_units=30,
+    generate_templates=True,
+    template_method="brownian",
 ):
     """
     Sweeps Ts for a single (scheme, n_tx) configuration, pooling counts across trials.
+    Every symbol interval carries one random modulation symbol.
     """
     if rng_seed is not None:
         np.random.seed(rng_seed)
 
+    if template_method not in ("brownian", "first-passage"):
+        raise ValueError("template_method must be 'brownian' or 'first-passage'")
     if exp_root is None:
         exp_root = CUSTOM_DIR
+    if template_method == "first-passage":
+        # Keep exact-distribution templates separate from older stepwise runs.
+        exp_root = os.path.join(exp_root, "first-passage")
 
     exp_path = os.path.join(exp_root, f"N{int(n_tx)}")
-    ensure_experiment_templates(
-        n_tx=n_tx,
-        exp_dir=exp_path,
-        n_exp=n_exp_templates,
-        radius=RR,
-        total_time=T,
-        step_time=DT,
-        diffusion_coef=D,
-        distance=R0,
-        device=device,
-    )
+    if generate_templates:
+        template_limit = 100 if n_exp_templates is None else int(n_exp_templates)
+        ensure_experiment_templates(
+            n_tx=n_tx,
+            exp_dir=exp_path,
+            n_exp=template_limit,
+            radius=RR,
+            total_time=T,
+            step_time=DT,
+            diffusion_coef=D,
+            distance=R0,
+            device=device,
+            method=template_method,
+        )
+        effective_n_exp_templates = template_limit
+    else:
+        existing = set(os.listdir(exp_path)) if os.path.isdir(exp_path) else set()
+        contiguous_count = 0
+        while f"Exp_{contiguous_count:03d}.csv" in existing:
+            contiguous_count += 1
+        effective_n_exp_templates = contiguous_count if n_exp_templates is None else int(n_exp_templates)
+        if contiguous_count < effective_n_exp_templates:
+            raise FileNotFoundError(
+                f"Reuse-only mode needs {effective_n_exp_templates} consecutive templates in {exp_path}; found {contiguous_count}."
+            )
 
     ts_out, err_out, tot_out = [], [], []
 
     for ts in ts_values:
+        slot_delay = (slot_delay_for_symbol(ts, num_molecule_types)
+            if delay_between_molecules is None else float(delay_between_molecules))
         total_errors = 0
         total_units = 0
 
         for _ in range(num_trials):
-            bit_sequence = "".join(str(np.random.randint(0, 2)) for _ in range(seq_length))
-            if mode == "ser" and bit_sequence.count("1") == 0:
-                continue
+            # One modulation symbol is sent in every period. The modulation
+            # alphabet itself includes the empty MoCSK/E-MoCSK symbol.
+            bit_sequence = "1" * seq_length
 
             try:
                 errors, units = _single_trial_counts(
@@ -174,9 +407,9 @@ def sweep_ts_pooled(
                     num_molecule_types=num_molecule_types,
                     ts=ts,
                     exp_path=exp_path,
-                    num_experiments=n_exp_templates,
+                    num_experiments=effective_n_exp_templates,
                     normalization=normalization,
-                    delay_between_molecules=delay_between_molecules,
+                    delay_between_molecules=slot_delay,
                     mode=mode,
                 )
             except Exception as exc:
@@ -384,15 +617,35 @@ def run_ser_vs_ts_sweep(
 
 
 if __name__ == "__main__":
-    figures_dir = os.path.join(PROJECT_DIR, "results", "figures")
-    out_fig = os.path.join(figures_dir, "ser_vs_ts_sweep.png")
+    import argparse
 
-    run_ser_vs_ts_sweep(
-        schemes=["permutation", "combo_fixed", "combo_adaptive", "sparse"],
-        n_tx_list=[500, 1000],
-        ts_values=[0.20, 0.25, 0.30, 0.35, 0.40],
-        num_molecule_types=5,
-        seq_length=50,
-        num_trials=5,
-        save_path=out_fig,
+    parser = argparse.ArgumentParser(description="Run the requested SER/goodput sweeps.")
+    parser.add_argument("--trials", type=int, default=10, help="Monte Carlo trials per point (default: 10)")
+    parser.add_argument("--symbols", type=int, default=100, help="modulation symbols per trial (default: 100)")
+    parser.add_argument("--templates", default="100", help="templates per N_Tx, or 'auto' to reuse all consecutive existing files")
+    parser.add_argument("--template-method", choices=("brownian", "first-passage"),
+                        default="brownian",
+                        help="channel-template generator; first-passage samples the exact absorbing-sphere arrival law")
+    parser.add_argument("--ts-n-tx", type=int, default=500, help="fixed N_Tx for the Ts sweep (default: 500)")
+    parser.add_argument("--ts-values", default="0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0",
+                        help="comma-separated Ts sweep values in seconds")
+    parser.add_argument("--exp-root", help="directory containing N100, N500, ... template folders")
+    parser.add_argument("--n-tx-values", default="100,200,300,400,500,600,700,800,900,1000",
+                        help="comma-separated N_Tx values for the N_Tx sweep")
+    parser.add_argument("--molecule-types", default="2,3,4,5,6,7,8,9,10",
+                        help="comma-separated molecule type counts")
+    parser.add_argument("--reuse-only", action="store_true",
+                        help="use existing templates only and fail instead of generating missing ones")
+    args = parser.parse_args()
+    run_requested_sweeps(
+        seq_length=args.symbols,
+        num_trials=args.trials,
+        n_exp_templates=None if args.templates.lower() == "auto" else int(args.templates),
+        ts_sweep_n_tx=args.ts_n_tx,
+        exp_root=args.exp_root,
+        n_tx_values=[int(x) for x in args.n_tx_values.split(",")],
+        molecule_type_counts=[int(x) for x in args.molecule_types.split(",")],
+        ts_values=[float(x) for x in args.ts_values.split(",")],
+        template_method=args.template_method,
+        generate_templates=not args.reuse_only,
     )

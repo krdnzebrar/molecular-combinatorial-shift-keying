@@ -116,13 +116,28 @@ res_combo = run_combination_fixed(
 )
 ```
 
-### 3. Running Monte Carlo SER vs $T_s$ Sweep
+### 3. Running Monte Carlo SER and Goodput Sweeps
 ```bash
 python -m experiments.sweep
 ```
-Features:
-- Sweeps $T_s \in [0.20, 0.40]\text{ s}$ and $N_{\text{Tx}} \in \{500, 1000\}$ molecules.
-- Pools errors across all trials per point.
-- Evaluates 95% Wilson score confidence intervals.
-- Safely handles zero errors on logarithmic plots by showing 95% upper bound markers (`0/n`).
-- Saves figures directly to `results/figures/ser_vs_ts_sweep.png`.
+This runs the requested two families of plots for $K=2,\ldots,10$ comparing all four implemented schemes:
+
+- **SER and goodput vs. $T_s$:** $T_s=0.2,0.3,\ldots,1.0$ s for every $K=2,\ldots,10$, with $N_{\text{Tx}}=500$ held fixed.
+- **SER and goodput vs. $N_{\text{Tx}}$:** $N_{\text{Tx}}=100,200,\ldots,1000$, with $T_s=1/K$ for each $K$.
+- For the sweeps, releases use uniform spacing $\Delta=T_s/K$, including across consecutive symbols; moving-average width shrinks when slots are close. The receiver decodes with the expected channel peak delay, so decisions can use a short look-ahead into the next interval.
+- Pools symbol errors across Monte Carlo trials and calculates 95% Wilson intervals.
+- The sweep transmits one modulation symbol in every symbol period, with the empty symbol represented explicitly in the MoCSK/E-MoCSK alphabets. Goodput is $(1-\mathrm{SER})\log_2(M)/T_s$ bits/s. It is a SER-based estimate, not a BER measurement.
+- Saves each vector PDF to `results/figures/ser_goodput_vs_ts.pdf` and `results/figures/ser_goodput_vs_n_tx.pdf`. Each PDF has a SER page and a SER-based goodput page, with one panel per molecule count so methods can be compared without overlaying all $K$ values. Pooled point-by-point data and confidence intervals are saved to `results/sweep_results.csv`.
+
+For a quicker exploratory run, lower the trial, sequence, and template counts:
+```bash
+python -m experiments.sweep --trials 2 --symbols 20 --templates 10
+```
+
+To reuse existing channel templates without generating missing files, pass their parent directory, restrict the NTx sweep to available `N...` folders, and enable reuse-only mode. The Ts sweep also requires the folder given by `--ts-n-tx`. For example, if the prior templates are in `../modulation_research/netlab/custom`:
+```bash
+python -m experiments.sweep --exp-root "../modulation_research/netlab/custom" --n-tx-values 100,500,1000 --templates auto --molecule-types 5 --trials 2 --symbols 20 --reuse-only
+```
+Reuse-only mode fails instead of silently generating templates if a requested folder is missing or has too few CSV files. Existing folders contain channel templates, not precomputed SER/goodput points, so the modulation and decoding trials still need to run before the PDFs and summary CSV can be plotted.
+
+The default full run can take a long time because it covers many configurations. The permutation and sparse encoders sample directly from their alphabets rather than materializing every possible symbol. The project still does not implement the paper's discrete maximum-likelihood detector or BER-based goodput; the plots compare the four existing moving-average/threshold-based scheme implementations and use SER-based goodput.

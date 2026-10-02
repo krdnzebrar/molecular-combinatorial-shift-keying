@@ -13,7 +13,6 @@ import matplotlib.pyplot as plt
 
 from config import DT, CUSTOM_DIR
 from utils.signal import moving_average
-from modulation.alphabet import get_all_permutations
 from modulation.encoder import build_signal, save_signal_csv
 from detection.peak_decoder import robust_decode
 
@@ -58,9 +57,7 @@ def generate_bit_sequence_transmission(
         exp_path = os.path.join(CUSTOM_DIR, "N1000")
 
     molecule_names = [chr(65 + i) for i in range(num_molecule_types)]
-    all_perms, perm_strings = get_all_permutations(num_molecule_types)
-
-    print(f"Total permutations available: {len(all_perms)}")
+    print(f"Total permutations available: {num_molecule_types}!")
     print(f"Bit sequence length: {len(bit_sequence)}")
     print(f"Number of '1's (symbols to send): {bit_sequence.count('1')}\n")
 
@@ -68,8 +65,9 @@ def generate_bit_sequence_transmission(
     symbol_transmissions = []
     for bit_idx, bit in enumerate(bit_sequence):
         if bit == '1':
-            perm_idx = np.random.randint(0, len(all_perms))
-            selected_perm = all_perms[perm_idx]
+            # Sample one permutation directly; materializing K! candidates is
+            # prohibitive for the requested K=2..10 sweeps.
+            selected_perm = tuple(np.random.permutation(num_molecule_types))
             perm_names = ''.join(molecule_names[i] for i in selected_perm)
 
             symbol_transmissions.append({

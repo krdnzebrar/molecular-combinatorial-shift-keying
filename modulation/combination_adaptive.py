@@ -1,19 +1,20 @@
 """
 modulation/combination_adaptive.py
 ===================================
-Combination scheme with adaptive per-symbol threshold.
+MoCSK ordered-subset scheme with an adaptive per-symbol threshold.
 
-Each '1' bit carries a random non-empty subset of the molecule alphabet.
-Decoded by finding the largest gap in per-channel smoothed peak values.
+Each active interval carries a uniformly sampled ordered subset, including
+the empty symbol. Slot peaks are detected from baseline-subtracted rises.
 """
 
 import os
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 
 from config import DT, CUSTOM_DIR
 from utils.signal import moving_average
-from modulation.alphabet import get_all_combinations
+from modulation.alphabet import sample_ordered_subset
 from modulation.encoder import build_signal, save_signal_csv
 from detection.threshold_decoder import decode_combinations_adaptive
 
@@ -39,9 +40,11 @@ def generate_combination_transmission(
         exp_path = os.path.join(CUSTOM_DIR, "N1000")
 
     molecule_names = [chr(65 + i) for i in range(num_molecule_types)]
-    all_combos, combo_strings = get_all_combinations(num_molecule_types)
-
-    print(f"Total combinations available: {len(all_combos)}")
+    print("MoCSK ordered-subset alphabet size: " + str(sum(
+        math.factorial(num_molecule_types)
+        // math.factorial(num_molecule_types - size)
+        for size in range(num_molecule_types + 1)
+    )))
     print(f"Bit sequence length: {len(bit_sequence)}")
     print(f"Number of '1's (symbols to send): {bit_sequence.count('1')}\n")
 
@@ -49,13 +52,14 @@ def generate_combination_transmission(
     symbol_transmissions = []
     for bit_idx, bit in enumerate(bit_sequence):
         if bit == '1':
-            idx = np.random.randint(0, len(all_combos))
+            selected_combo = sample_ordered_subset(num_molecule_types)
+            combo_string = ''.join(molecule_names[m] for m in selected_combo)
             symbol_transmissions.append({
                 'bit_position': bit_idx,
-                'combo': all_combos[idx],
-                'permutation_names': combo_strings[idx],
+                'combo': selected_combo,
+                'permutation_names': combo_string,
             })
-            print(f"Bit {bit_idx}: Sending {combo_strings[idx]}")
+            print(f"Bit {bit_idx}: Sending {combo_string or 'EMPTY'}")
 
     # ── Signal building ──────────────────────────────────────────────────
     combined_signal, time_axis, molecule_signals = build_signal(
@@ -72,7 +76,7 @@ def generate_combination_transmission(
         molecule_signals, bit_sequence, dt_bin,
         num_molecule_types, molecule_names,
         delay_between_symbols, delay_between_molecules,
-        all_combos, combo_strings,
+        None, None,
     )
 
     print(f"\n=== Decoded {len(decoded_symbols)} symbols ===\n")

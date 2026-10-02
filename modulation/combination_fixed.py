@@ -1,19 +1,20 @@
 """
 modulation/combination_fixed.py
 ================================
-Combination scheme with fixed (calibrated) threshold.
+MoCSK ordered-subset scheme with an unlabeled global threshold.
 
-Same encoding as adaptive, but uses a global threshold calibrated from
-ground-truth labels before decoding. More robust across symbols.
+Each active interval carries a uniformly sampled ordered subset, including
+the empty symbol. The threshold is estimated from observed slot-rise scores.
 """
 
 import os
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 
 from config import DT, CUSTOM_DIR, SMOOTHING_WINDOW
-from utils.signal import moving_average
-from modulation.alphabet import get_all_combinations
+from utils.signal import moving_average, adaptive_smoothing_window
+from modulation.alphabet import sample_ordered_subset
 from modulation.encoder import build_signal, save_signal_csv
 from detection.threshold_decoder import (
     calibrate_fixed_threshold,
@@ -42,9 +43,11 @@ def generate_combination_transmission(
         exp_path = os.path.join(CUSTOM_DIR, "N1000")
 
     molecule_names = [chr(65 + i) for i in range(num_molecule_types)]
-    all_combos, combo_strings = get_all_combinations(num_molecule_types)
-
-    print(f"Total combinations available : {len(all_combos)}")
+    print("MoCSK ordered-subset alphabet size: " + str(sum(
+        math.factorial(num_molecule_types)
+        // math.factorial(num_molecule_types - size)
+        for size in range(num_molecule_types + 1)
+    )))
     print(f"Bit sequence length          : {len(bit_sequence)}")
     print(f"Number of '1's               : {bit_sequence.count('1')}\n")
 
@@ -52,13 +55,14 @@ def generate_combination_transmission(
     symbol_transmissions = []
     for bit_idx, bit in enumerate(bit_sequence):
         if bit == '1':
-            idx = np.random.randint(0, len(all_combos))
+            selected_combo = sample_ordered_subset(num_molecule_types)
+            combo_string = ''.join(molecule_names[m] for m in selected_combo)
             symbol_transmissions.append({
                 'bit_position': bit_idx,
-                'combo': all_combos[idx],
-                'permutation_names': combo_strings[idx],
+                'combo': selected_combo,
+                'permutation_names': combo_string,
             })
-            print(f"Bit {bit_idx:3d}: Sending {combo_strings[idx]}")
+            print(f"Bit {bit_idx:3d}: Sending {combo_string or 'EMPTY'}")
 
     # ── Signal building ──────────────────────────────────────────────────
     combined_signal, time_axis, molecule_signals = build_signal(
@@ -71,13 +75,15 @@ def generate_combination_transmission(
     # ── Pre-smooth for calibration ───────────────────────────────────────
     dt_bin = normalization * DT
     smoothed_signals = np.zeros_like(molecule_signals)
+    smooth_window = adaptive_smoothing_window(
+        delay_between_molecules, dt_bin, SMOOTHING_WINDOW)
     for i in range(num_molecule_types):
-        smoothed_signals[i] = moving_average(molecule_signals[i], SMOOTHING_WINDOW)
+        smoothed_signals[i] = moving_average(molecule_signals[i], smooth_window)
 
     # ── Calibrate fixed threshold ────────────────────────────────────────
     fixed_threshold = calibrate_fixed_threshold(
         smoothed_signals, symbol_transmissions, dt_bin,
-        num_molecule_types, delay_between_symbols,
+        num_molecule_types, delay_between_symbols, delay_between_molecules,
     )
 
     # ── Decoding ─────────────────────────────────────────────────────────
@@ -86,8 +92,9 @@ def generate_combination_transmission(
         molecule_signals, bit_sequence, dt_bin,
         num_molecule_types, molecule_names,
         delay_between_symbols,
-        all_combos, combo_strings,
+        None, None,
         fixed_threshold,
+        delay_between_molecules=delay_between_molecules,
     )
 
     print(f"\n=== Decoded {len(decoded_symbols)} symbols ===\n")

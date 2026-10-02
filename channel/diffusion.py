@@ -20,6 +20,7 @@ import time
 
 import numpy as np
 import torch
+from scipy.special import erfc, erfcinv
 
 
 # ============================================================
@@ -267,6 +268,7 @@ def simulate_experiment_csv(
     distance=DEFAULT_DISTANCE,
     device=None,
     override=False,
+    method="brownian",
 ):
     """
     Brownian-motion simulation of `n_tx` molecules. Saves per-step
@@ -282,6 +284,45 @@ def simulate_experiment_csv(
         return filename
 
     n_steps = int(round(total_time / step_time))
+
+    if method == "first-passage":
+        if distance <= radius:
+            raise ValueError("distance must exceed receiver radius")
+        if step_time <= 0 or total_time <= 0 or diffusion_coef <= 0:
+            raise ValueError("step_time, total_time, and diffusion_coef must be positive")
+
+        # Exact first-arrival distribution for a point source and a perfectly
+        # absorbing sphere in unbounded 3-D diffusion. This avoids advancing
+        # every molecule through all 50,000 time steps.
+        cdf_end = (radius / distance) * erfc(
+            (distance - radius) / math.sqrt(4.0 * diffusion_coef * total_time)
+        )
+        uniforms = np.random.random(int(n_tx))
+        received = uniforms < cdf_end
+        if np.any(received):
+            erfc_argument = uniforms[received] * distance / radius
+            erfc_argument = np.maximum(erfc_argument, np.finfo(float).tiny)
+            hit_times = ((distance - radius) ** 2) / (
+                4.0 * diffusion_coef * erfcinv(erfc_argument) ** 2
+            )
+            # Record arrivals in the first discrete sample at or after the
+            # continuous hitting time, matching the template's time grid.
+            hit_bins = np.ceil(hit_times / step_time).astype(np.int64) - 1
+            hit_bins = np.clip(hit_bins, 0, n_steps - 1)
+            hit_counts = np.bincount(hit_bins, minlength=n_steps).astype(float)
+        else:
+            hit_counts = np.zeros(n_steps, dtype=float)
+
+        time_axis = (np.arange(n_steps, dtype=float) + 1.0) * step_time
+        output = np.column_stack((time_axis, hit_counts))
+        with open(filename, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Time", "Number of Molecules"])
+            writer.writerows(output)
+        return filename
+
+    if method != "brownian":
+        raise ValueError("method must be 'brownian' or 'first-passage'")
 
     positions = torch.zeros((int(n_tx), 3), device=device)
     positions[:, 2] = distance
@@ -324,6 +365,7 @@ def ensure_experiment_templates(
     distance=DEFAULT_DISTANCE,
     device=None,
     override=False,
+    method="brownian",
 ):
     """
     Returns a directory of `n_exp` Exp_xxx.csv templates generated with
@@ -342,7 +384,7 @@ def ensure_experiment_templates(
         return exp_dir
 
     _dev = device if device is not None else get_device()
-    print(f"[gen]   N_Tx={n_tx}: generating {n_exp} templates in {exp_dir} (device={_dev}) ...")
+    print(f"[gen]   N_Tx={n_tx}: generating {n_exp} {method} templates in {exp_dir} (device={_dev}) ...")
     t0 = time.time()
     for i in range(n_exp):
         simulate_experiment_csv(
@@ -356,6 +398,7 @@ def ensure_experiment_templates(
             distance=distance,
             device=device,
             override=override,
+            method=method,
         )
     print(f"[gen]   N_Tx={n_tx}: done in {time.time() - t0:.1f}s")
     return exp_dir

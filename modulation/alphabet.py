@@ -6,6 +6,8 @@ Single definitions — previously duplicated across scheme cells.
 """
 
 from itertools import permutations, combinations
+import math
+import numpy as np
 
 
 def get_all_permutations(num_molecule_types):
@@ -46,13 +48,26 @@ def get_all_combinations(num_molecule_types):
     return all_combos, combo_strings
 
 
+def sample_ordered_subset(num_molecule_types):
+    """Uniformly sample a MoCSK symbol, including the empty symbol."""
+    k = int(num_molecule_types)
+    sizes = np.arange(k + 1)
+    counts = np.asarray([
+        math.factorial(k) // math.factorial(k - size)
+        for size in sizes
+    ], dtype=float)
+    size = int(np.random.choice(sizes, p=counts / counts.sum()))
+    if size == 0:
+        return tuple()
+    return tuple(int(m) for m in np.random.permutation(k)[:size])
+
+
 def get_all_sparse_patterns(num_molecule_types):
     """
     All sparse patterns: partial slot fills with permutations.
 
-    For each number of active slots 1..K, choose which slots are active,
-    then fill them with a permutation of molecule types.  Empty slots are
-    represented as None.
+    Includes the all-empty symbol, then for each active-slot count 1..K
+    chooses slots and assigns distinct molecule types. Empty slots are None.
 
     Returns
     -------
@@ -64,6 +79,8 @@ def get_all_sparse_patterns(num_molecule_types):
     molecule_names = [chr(65 + i) for i in range(num_molecule_types)]
     all_patterns = []
     pattern_strings = []
+    all_patterns.append(tuple([None] * num_molecule_types))
+    pattern_strings.append('_' * num_molecule_types)
     for num_active in range(1, num_molecule_types + 1):
         for active_slots in combinations(range(num_molecule_types), num_active):
             for mol_perm in permutations(range(num_molecule_types), num_active):

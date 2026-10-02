@@ -9,12 +9,12 @@ exclusion to prevent diffusion tail re-detection.
 """
 
 import os
+import math
 import numpy as np
 import matplotlib.pyplot as plt
 
 from config import DT, R0, RR, D, CUSTOM_DIR, SMOOTHING_WINDOW
-from utils.signal import moving_average
-from modulation.alphabet import get_all_sparse_patterns
+from utils.signal import moving_average, adaptive_smoothing_window
 from modulation.encoder import build_signal, save_signal_csv
 from detection.sparse_decoder import calibrate_sparse_threshold, decode_sparse_fixed
 
@@ -40,9 +40,15 @@ def generate_sparse_bit_sequence_transmission(
         exp_path = os.path.join(CUSTOM_DIR, "N1000")
 
     molecule_names = [chr(65 + i) for i in range(num_molecule_types)]
-    all_patterns, pattern_strings = get_all_sparse_patterns(num_molecule_types)
-
-    print(f"Total sparse patterns available : {len(all_patterns)}")
+    # The full sparse alphabet grows super-exponentially. Sample uniformly
+    # from its members without constructing every pattern.
+    pattern_counts = [
+        math.comb(num_molecule_types, active) ** 2
+        * math.factorial(active)
+        for active in range(num_molecule_types + 1)
+    ]
+    pattern_count = sum(pattern_counts)
+    print(f"Total sparse patterns available : {pattern_count}")
     print(f"Bit sequence length             : {len(bit_sequence)}")
     print(f"Number of '1's                  : {bit_sequence.count('1')}\n")
 
@@ -50,13 +56,24 @@ def generate_sparse_bit_sequence_transmission(
     symbol_transmissions = []
     for bit_idx, bit in enumerate(bit_sequence):
         if bit == '1':
-            idx = np.random.randint(0, len(all_patterns))
+            active_count = int(np.random.choice(
+                np.arange(num_molecule_types + 1),
+                p=np.asarray(pattern_counts, dtype=float) / pattern_count,
+            ))
+            pattern = [None] * num_molecule_types
+            if active_count:
+                slots = np.random.choice(num_molecule_types, size=active_count, replace=False)
+                molecules = np.random.choice(num_molecule_types, size=active_count, replace=False)
+                for slot, molecule in zip(slots, molecules):
+                    pattern[int(slot)] = int(molecule)
+            pattern = tuple(pattern)
+            pattern_string = ''.join(molecule_names[m] if m is not None else '_' for m in pattern)
             symbol_transmissions.append({
                 'bit_position': bit_idx,
-                'pattern': all_patterns[idx],
-                'permutation_names': pattern_strings[idx],
+                'pattern': pattern,
+                'permutation_names': pattern_string,
             })
-            print(f"Bit {bit_idx:3d}: Sending {pattern_strings[idx]}")
+            print(f"Bit {bit_idx:3d}: Sending {pattern_string}")
 
     # ── Signal building ──────────────────────────────────────────────────
     combined_signal, time_axis, molecule_signals = build_signal(
@@ -69,8 +86,10 @@ def generate_sparse_bit_sequence_transmission(
     # ── Pre-smooth for calibration ───────────────────────────────────────
     dt_bin = normalization * DT
     smoothed_signals = np.zeros_like(molecule_signals)
+    smooth_window = adaptive_smoothing_window(
+        delay_between_molecules, dt_bin, SMOOTHING_WINDOW)
     for i in range(num_molecule_types):
-        smoothed_signals[i] = moving_average(molecule_signals[i], SMOOTHING_WINDOW)
+        smoothed_signals[i] = moving_average(molecule_signals[i], smooth_window)
 
     # ── Calibrate fixed threshold ────────────────────────────────────────
     fixed_threshold, mean_present, mean_absent = calibrate_sparse_threshold(
@@ -84,7 +103,7 @@ def generate_sparse_bit_sequence_transmission(
         molecule_signals, bit_sequence, dt_bin,
         num_molecule_types, molecule_names,
         delay_between_symbols, delay_between_molecules,
-        all_patterns, pattern_strings,
+        None, None,
         fixed_threshold,
     )
 
@@ -149,7 +168,7 @@ def generate_sparse_bit_sequence_transmission(
         # Panel 4: present vs absent channel peak scatter
         plt.subplot(4, 1, 4)
         t_peak_theory = (R0 - RR)**2 / (6 * D)
-        half_w = delay_between_molecules * 0.8
+        half_w = delay_between_molecules * 0.45
         all_present, all_absent = [], []
         for symbol in symbol_transmissions:
             bit_pos = symbol['bit_position']
@@ -167,7 +186,9 @@ def generate_sparse_bit_sequence_transmission(
                 if s >= e:
                     continue
                 for m in range(num_molecule_types):
-                    peak = float(np.max(smoothed_signals[m, s:e]))
+                    baseline_idx = max(0, s - max(1, int(half_w / dt_bin)))
+                    peak = max(float(np.max(smoothed_signals[m, s:e]))
+                               - float(smoothed_signals[m, baseline_idx]), 0.0)
                     if m == sent_mol:
                         all_present.append(peak)
                     else:
@@ -179,10 +200,6 @@ def generate_sparse_bit_sequence_transmission(
                     alpha=0.3, label='Absent channel peaks')
         plt.axhline(fixed_threshold, color='red', linewidth=2, linestyle='--',
                     label=f'Fixed threshold ({fixed_threshold:.3f})')
-        plt.axhline(mean_present, color='green', linewidth=1, linestyle=':',
-                    label=f'Mean present ({mean_present:.3f})')
-        plt.axhline(mean_absent, color='gray', linewidth=1, linestyle=':',
-                    label=f'Mean absent ({mean_absent:.3f})')
         plt.xlabel('Sample index'); plt.ylabel('Smoothed Peak Value')
         plt.title('Present vs Absent Channel Peaks — Fixed Threshold Separation')
         plt.legend(fontsize=8); plt.grid(True)
