@@ -123,7 +123,6 @@ def run_requested_sweeps(
     seq_length=100, num_trials=10, n_exp_templates=100, exp_root=None,
     delay_between_molecules=None, rng_seed=42, ts_sweep_n_tx=500,
     ts_values=None,
-    template_method="brownian",
     generate_templates=True,
     results_dir=None,
 ):
@@ -157,8 +156,7 @@ def run_requested_sweeps(
                 scheme, ts_values, fixed_n_tx, num_molecule_types=k,
                 seq_length=seq_length, num_trials=num_trials, exp_root=exp_root,
                 n_exp_templates=n_exp_templates, delay_between_molecules=delay_between_molecules,
-                rng_seed=rng_seed, mode="ser", generate_templates=generate_templates,
-                template_method=template_method)
+                rng_seed=rng_seed, mode="ser", generate_templates=generate_templates)
             rows.extend(_summarize_point(scheme, k, fixed_n_tx, ts_data[scheme][k], "ts"))
 
     # N_Tx sweep: one curve per K and method, at its minimum Ts=1/K.
@@ -172,8 +170,7 @@ def run_requested_sweeps(
                     scheme, [1.0 / k], n_tx, num_molecule_types=k,
                     seq_length=seq_length, num_trials=num_trials, exp_root=exp_root,
                     n_exp_templates=n_exp_templates, delay_between_molecules=delay_between_molecules,
-                    rng_seed=rng_seed, mode="ser", generate_templates=generate_templates,
-                    template_method=template_method)
+                    rng_seed=rng_seed, mode="ser", generate_templates=generate_templates)
                 ntx_data[scheme][k][n_tx] = counts
                 rows.extend(_summarize_point(scheme, k, n_tx, counts, "n_tx"))
 
@@ -343,7 +340,6 @@ def sweep_ts_pooled(
     mode="ser",
     min_informative_units=30,
     generate_templates=True,
-    template_method="brownian",
 ):
     """
     Sweeps Ts for a single (scheme, n_tx) configuration, pooling counts across trials.
@@ -352,13 +348,8 @@ def sweep_ts_pooled(
     if rng_seed is not None:
         np.random.seed(rng_seed)
 
-    if template_method not in ("brownian", "first-passage"):
-        raise ValueError("template_method must be 'brownian' or 'first-passage'")
     if exp_root is None:
         exp_root = CUSTOM_DIR
-    if template_method == "first-passage":
-        # Keep exact-distribution templates separate from older stepwise runs.
-        exp_root = os.path.join(exp_root, "first-passage")
 
     exp_path = os.path.join(exp_root, f"N{int(n_tx)}")
     if generate_templates:
@@ -373,7 +364,6 @@ def sweep_ts_pooled(
             diffusion_coef=D,
             distance=R0,
             device=device,
-            method=template_method,
         )
         effective_n_exp_templates = template_limit
     else:
@@ -623,9 +613,6 @@ if __name__ == "__main__":
     parser.add_argument("--trials", type=int, default=10, help="Monte Carlo trials per point (default: 10)")
     parser.add_argument("--symbols", type=int, default=100, help="modulation symbols per trial (default: 100)")
     parser.add_argument("--templates", default="100", help="templates per N_Tx, or 'auto' to reuse all consecutive existing files")
-    parser.add_argument("--template-method", choices=("brownian", "first-passage"),
-                        default="brownian",
-                        help="channel-template generator; first-passage samples the exact absorbing-sphere arrival law")
     parser.add_argument("--ts-n-tx", type=int, default=500, help="fixed N_Tx for the Ts sweep (default: 500)")
     parser.add_argument("--ts-values", default="0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0",
                         help="comma-separated Ts sweep values in seconds")
@@ -646,6 +633,5 @@ if __name__ == "__main__":
         n_tx_values=[int(x) for x in args.n_tx_values.split(",")],
         molecule_type_counts=[int(x) for x in args.molecule_types.split(",")],
         ts_values=[float(x) for x in args.ts_values.split(",")],
-        template_method=args.template_method,
         generate_templates=not args.reuse_only,
     )
