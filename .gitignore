@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+env/
+.env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Simulation outputs (large files)
+simulations/
+*.pt
+*.csv
+!requirements.txt
+
+# Results (keep figures, ignore large data)
+results/*.csv
+results/*.pt
+results/*.npz
+
+# Custom experiment data
+custom/
