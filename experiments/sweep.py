@@ -1,11 +1,10 @@
 """
 experiments/sweep.py
 ====================
-Monte-Carlo SER/BER vs Ts sweep across the 4 MoCSK-family schemes:
+Monte-Carlo SER and BER-approximation sweeps across three implemented schemes:
   1. Permutation (smoothed-peak arrival order)
-  2. Combination with fixed calibrated threshold
-  3. Combination with adaptive gap-based threshold
-  4. Sparse pattern with fixed threshold and molecule exclusion
+  2. MoCSK ordered subset with a channel-derived fixed threshold
+  3. E-MoCSK sparse patterns with empty-slot assignment
 
 Features:
   - N_Tx sweep (100, 200, ..., 1000 by default) wired to per-N cached templates.
@@ -18,6 +17,8 @@ import os
 import sys
 import math
 import csv
+import json
+import contextlib
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.lines as mlines
@@ -34,33 +35,30 @@ from evaluation.metrics import wilson_ci, print_methodology_note
 
 from modulation.permutation import generate_bit_sequence_transmission as run_permutation
 from modulation.combination_fixed import generate_combination_transmission as run_combo_fixed
-from modulation.combination_adaptive import generate_combination_transmission as run_combo_adaptive
 from modulation.sparse import generate_sparse_bit_sequence_transmission as run_sparse
 
 
 SCHEME_RUNNERS = {
     "permutation": run_permutation,
     "combo_fixed": run_combo_fixed,
-    "combo_adaptive": run_combo_adaptive,
     "sparse": run_sparse,
 }
 
 _SCHEME_COLORS = {
     "permutation": "#378ADD",
     "combo_fixed": "#1D9E75",
-    "combo_adaptive": "#D85A30",
     "sparse": "#7F77DD",
 }
 
 _SCHEME_LABELS = {
     "permutation": "Permutation",
-    "combo_fixed": "MoCSK (unlabeled fixed threshold)",
-    "combo_adaptive": "MoCSK (adaptive ratio threshold)",
+    "combo_fixed": "MoCSK (channel-calibrated threshold)",
     "sparse": "E-MoCSK (slot selection)",
 }
 
 _LINE_STYLES = ["-", "--", ":", "-."]
 _MARKERS = ["o", "s", "^", "D", "v"]
+_SWEEP_DETAIL_LOG = None
 
 
 def information_bits_per_symbol(scheme, num_molecule_types):
@@ -68,7 +66,7 @@ def information_bits_per_symbol(scheme, num_molecule_types):
     k = int(num_molecule_types)
     if scheme == "permutation":
         log2_m = math.lgamma(k + 1) / math.log(2)
-    elif scheme in ("combo_fixed", "combo_adaptive"):
+    elif scheme == "combo_fixed":
         alphabet_size = sum(math.factorial(k) // math.factorial(k - j)
                             for j in range(k + 1))
         log2_m = math.log2(alphabet_size)
@@ -85,20 +83,24 @@ def slot_delay_for_symbol(ts, num_molecule_types):
     """Use a uniform release grid, including across consecutive symbol boundaries."""
     k = int(num_molecule_types)
     if k <= 1:
-        return min(float(max_delay), float(ts))
+        return float(ts)
     # Keeping Δ=Ts/K makes the gap from the last slot of one active symbol
     # to the first slot of the next consecutive symbol equal to every other gap.
     return float(ts) / k
 
 
-def _save_sweep_csv(path, rows):
+_SWEEP_COLUMNS = ["sweep", "scheme", "num_molecule_types", "n_tx", "ts", "errors",
+                  "total_symbols", "ser", "ser_ci_low", "ser_ci_high",
+                  "ber_approx", "bits_per_symbol", "goodput_bits_per_second"]
+
+
+def _save_sweep_csv(path, rows, append=False):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    columns = ["sweep", "scheme", "num_molecule_types", "n_tx", "ts", "errors",
-               "total_symbols", "ser", "ser_ci_low", "ser_ci_high",
-               "bits_per_symbol", "goodput_bits_per_second"]
-    with open(path, "w", newline="") as stream:
-        writer = csv.DictWriter(stream, fieldnames=columns)
-        writer.writeheader()
+    write_header = not append or not os.path.exists(path) or os.path.getsize(path) == 0
+    with open(path, "a" if append else "w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=_SWEEP_COLUMNS)
+        if write_header:
+            writer.writeheader()
         writer.writerows(rows)
 
 
@@ -108,27 +110,31 @@ def _summarize_point(scheme, k, n_tx, counts, sweep):
         ser, low, high = wilson_ci(int(errors), int(total))
         bps = information_bits_per_symbol(scheme, k)
         ts = float(counts["ts"][idx])
+        m = 2.0 ** bps
+        ber_approx = ser * m / (2.0 * (m - 1.0)) if m > 1.0 else ser
         rows.append({
             "sweep": sweep, "scheme": scheme, "num_molecule_types": k,
             "n_tx": n_tx, "ts": ts, "errors": int(errors),
             "total_symbols": int(total), "ser": ser, "ser_ci_low": low,
             "ser_ci_high": high, "bits_per_symbol": bps,
-            "goodput_bits_per_second": (1.0 - ser) * bps / ts if total else float("nan"),
+            "goodput_bits_per_second": (1.0 - ber_approx) * bps / ts if total else float("nan"),
+            "ber_approx": ber_approx,
         })
     return rows
 
 
 def run_requested_sweeps(
     *, schemes=None, molecule_type_counts=range(2, 11), n_tx_values=range(100, 1001, 100),
-    seq_length=100, num_trials=10, n_exp_templates=100, exp_root=None,
+    seq_length=200, num_trials=10, n_exp_templates=100, exp_root=None,
     delay_between_molecules=None, rng_seed=42, ts_sweep_n_tx=500,
     ts_values=None,
     generate_templates=True,
     results_dir=None,
 ):
     """Run the Ts and N_Tx sweeps, save PDF plots and a combined CSV."""
+    global _SWEEP_DETAIL_LOG
     if schemes is None:
-        schemes = ["permutation", "combo_fixed", "combo_adaptive", "sparse"]
+        schemes = ["permutation", "combo_fixed", "sparse"]
     ks = [int(k) for k in molecule_type_counts]
     nts = [int(n) for n in n_tx_values]
     if ts_values is None:
@@ -145,6 +151,26 @@ def run_requested_sweeps(
     figures_dir = os.path.join(results_dir, "figures")
     os.makedirs(figures_dir, exist_ok=True)
     rows = []
+    csv_path = os.path.join(results_dir, "sweep_results.csv")
+    metadata = {
+        "rng_seed": rng_seed, "trials_per_point": int(num_trials),
+        "symbols_per_trial": int(seq_length), "pooled_symbols_per_point": int(num_trials * seq_length),
+        "template_count": n_exp_templates if n_exp_templates is not None else "all consecutive templates",
+        "molecule_type_counts": ks, "schemes": list(schemes),
+        "n_tx_values": nts, "ts_values_seconds": ts_values,
+        "ts_sweep_fixed_n_tx": int(ts_sweep_n_tx),
+        "n_tx_sweep_fixed_ts_seconds": 1.0,
+        "slot_spacing": "Ts/K", "ber_method": "uniform-symbol-error approximation",
+        "scoring_method": "shared valley-minimum baseline",
+    }
+    os.makedirs(results_dir, exist_ok=True)
+    _SWEEP_DETAIL_LOG = os.path.join(results_dir, "sweep_detail.log")
+    with open(_SWEEP_DETAIL_LOG, "w") as stream:
+        stream.write("Detailed per-trial and per-symbol scheme output\n")
+        stream.write(json.dumps(metadata, indent=2) + "\n\n")
+    with open(os.path.join(results_dir, "sweep_metadata.json"), "w") as stream:
+        json.dump(metadata, stream, indent=2)
+    _save_sweep_csv(csv_path, [], append=False)
 
     # Ts sweep: one curve per K and method, with N_Tx fixed.
     ts_data = {}
@@ -156,10 +182,11 @@ def run_requested_sweeps(
                 scheme, ts_values, fixed_n_tx, num_molecule_types=k,
                 seq_length=seq_length, num_trials=num_trials, exp_root=exp_root,
                 n_exp_templates=n_exp_templates, delay_between_molecules=delay_between_molecules,
-                rng_seed=rng_seed, mode="ser", generate_templates=generate_templates)
-            rows.extend(_summarize_point(scheme, k, fixed_n_tx, ts_data[scheme][k], "ts"))
+                rng_seed=rng_seed, mode="ser", generate_templates=generate_templates,
+                checkpoint_callback=lambda point: _save_point_checkpoint(
+                    csv_path, rows, scheme, k, fixed_n_tx, point, "ts"))
 
-    # N_Tx sweep: one curve per K and method, at its minimum Ts=1/K.
+    # N_Tx sweep: one curve per K and method at a common Ts=1 second.
     ntx_data = {}
     for scheme in schemes:
         ntx_data[scheme] = {}
@@ -167,16 +194,16 @@ def run_requested_sweeps(
             ntx_data[scheme][k] = {}
             for n_tx in nts:
                 counts = sweep_ts_pooled(
-                    scheme, [1.0 / k], n_tx, num_molecule_types=k,
+                    scheme, [1.0], n_tx, num_molecule_types=k,
                     seq_length=seq_length, num_trials=num_trials, exp_root=exp_root,
                     n_exp_templates=n_exp_templates, delay_between_molecules=delay_between_molecules,
-                    rng_seed=rng_seed, mode="ser", generate_templates=generate_templates)
+                    rng_seed=rng_seed, mode="ser", generate_templates=generate_templates,
+                    checkpoint_callback=lambda point, s=scheme, kk=k, nn=n_tx:
+                        _save_point_checkpoint(csv_path, rows, s, kk, nn, point, "n_tx"))
                 ntx_data[scheme][k][n_tx] = counts
-                rows.extend(_summarize_point(scheme, k, n_tx, counts, "n_tx"))
 
     _plot_metric_families(ts_data, ks, schemes, "ts", os.path.join(figures_dir, "ser_goodput_vs_ts.pdf"), fixed_n_tx)
     _plot_metric_families(ntx_data, ks, schemes, "n_tx", os.path.join(figures_dir, "ser_goodput_vs_n_tx.pdf"), None)
-    _save_sweep_csv(os.path.join(results_dir, "sweep_results.csv"), rows)
     print(f"Saved figures and pooled results under: {results_dir}")
     return {"ts": ts_data, "n_tx": ntx_data, "rows": rows}
 
@@ -189,7 +216,7 @@ def _plot_metric_families(data, ks, schemes, x_kind, path, fixed_n_tx):
     if x_kind == "ts":
         condition = f"$N_{{\\rm Tx}}={fixed_n_tx}$"
     else:
-        condition = "$T_s=1/K$ s for each K"
+        condition = "$T_s=1.0$ s (fixed for all K)"
 
     with PdfPages(path) as pdf:
         for metric in ("ser", "goodput"):
@@ -223,8 +250,11 @@ def _plot_metric_families(data, ks, schemes, x_kind, path, fixed_n_tx):
                             continue
                         ser, _, ci_high = wilson_ci(errors, total)
                         ts = float(counts["ts"][idx])
+                        bits = information_bits_per_symbol(scheme, k)
+                        m = 2.0 ** bits
+                        ber_approx = ser * m / (2.0 * (m - 1.0)) if m > 1.0 else ser
                         y = (ser if ser > 0 else ci_high) if metric == "ser" else (
-                            (1.0 - ser) * information_bits_per_symbol(scheme, k) / ts
+                            (1.0 - ber_approx) * bits / ts
                         )
                         xs.append(x)
                         ys.append(y)
@@ -242,7 +272,7 @@ def _plot_metric_families(data, ks, schemes, x_kind, path, fixed_n_tx):
                 ax.set_xlabel(xlabel)
                 ax.set_ylabel(
                     "SER (zero-error points show 95% upper bound)"
-                    if metric == "ser" else "SER-based goodput (bits/s)"
+                    if metric == "ser" else "BER-approx. goodput (bits/s)"
                 )
                 if metric == "ser":
                     ax.set_yscale("log")
@@ -251,7 +281,7 @@ def _plot_metric_families(data, ks, schemes, x_kind, path, fixed_n_tx):
             for idx in range(len(ks), nrows * ncols):
                 axes.flat[idx].set_visible(False)
 
-            title_metric = "SER" if metric == "ser" else "SER-based goodput"
+            title_metric = "SER" if metric == "ser" else "BER-approx. goodput"
             x_label = "$T_s$" if x_kind == "ts" else "$N_{\\rm Tx}$"
             fig.suptitle(f"{title_metric} vs {x_label} ({condition})", y=0.995)
             if plotted_handles:
@@ -265,6 +295,12 @@ def _plot_metric_families(data, ks, schemes, x_kind, path, fixed_n_tx):
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
     print(f"Figure saved -> {path}")
+
+
+def _save_point_checkpoint(path, rows, scheme, k, n_tx, point, sweep):
+    point_rows = _summarize_point(scheme, k, n_tx, point, sweep)
+    rows.extend(point_rows)
+    _save_sweep_csv(path, point_rows, append=True)
 
 
 def _single_trial_counts(
@@ -296,16 +332,21 @@ def _single_trial_counts(
         delay_between_symbols=ts,
         delay_between_molecules=delay_between_molecules,
         plot=False,
+        save_signal=False,
     )
 
-    _, _, transmissions, _, decoded = runner(**kwargs)
+    # Scheme pipelines print every transmitted/decoded symbol. Keep sweeps
+    # concise while preserving warnings and pooled point summaries outside.
+    log_target = _SWEEP_DETAIL_LOG or os.devnull
+    with open(log_target, "a") as detail_log, contextlib.redirect_stdout(detail_log):
+        _, _, transmissions, _, decoded = runner(**kwargs)
 
     if scheme in ("permutation", "sparse"):
         errors = sum(
             1 for s, d in zip(transmissions, decoded)
             if s["permutation_names"] != d["permutation"]
         )
-    elif scheme in ("combo_fixed", "combo_adaptive"):
+    elif scheme == "combo_fixed":
         errors = sum(
             1 for s, d in zip(transmissions, decoded)
             if s["permutation_names"] != d["decoded_combo"]
@@ -340,6 +381,7 @@ def sweep_ts_pooled(
     mode="ser",
     min_informative_units=30,
     generate_templates=True,
+    checkpoint_callback=None,
 ):
     """
     Sweeps Ts for a single (scheme, n_tx) configuration, pooling counts across trials.
@@ -390,21 +432,17 @@ def sweep_ts_pooled(
             # alphabet itself includes the empty MoCSK/E-MoCSK symbol.
             bit_sequence = "1" * seq_length
 
-            try:
-                errors, units = _single_trial_counts(
-                    scheme=scheme,
-                    bit_sequence=bit_sequence,
-                    num_molecule_types=num_molecule_types,
-                    ts=ts,
-                    exp_path=exp_path,
-                    num_experiments=effective_n_exp_templates,
-                    normalization=normalization,
-                    delay_between_molecules=slot_delay,
-                    mode=mode,
-                )
-            except Exception as exc:
-                print(f"  [WARN] scheme={scheme} N_Tx={n_tx} Ts={ts:.2f} -> {exc}")
-                continue
+            errors, units = _single_trial_counts(
+                scheme=scheme,
+                bit_sequence=bit_sequence,
+                num_molecule_types=num_molecule_types,
+                ts=ts,
+                exp_path=exp_path,
+                num_experiments=effective_n_exp_templates,
+                normalization=normalization,
+                delay_between_molecules=slot_delay,
+                mode=mode,
+            )
 
             total_errors += errors
             total_units += units
@@ -427,6 +465,12 @@ def sweep_ts_pooled(
         ts_out.append(ts)
         err_out.append(total_errors)
         tot_out.append(total_units)
+        if checkpoint_callback is not None:
+            checkpoint_callback({
+                "ts": np.array([ts], dtype=float),
+                "errors": np.array([total_errors], dtype=np.int64),
+                "totals": np.array([total_units], dtype=np.int64),
+            })
 
     return {
         "ts": np.array(ts_out, dtype=float),
@@ -566,7 +610,7 @@ def run_ser_vs_ts_sweep(
     Run full Monte Carlo SER vs Ts sweep across schemes and N_Tx values.
     """
     if schemes is None:
-        schemes = ["permutation", "combo_fixed", "combo_adaptive", "sparse"]
+        schemes = ["permutation", "combo_fixed", "sparse"]
     if n_tx_list is None:
         n_tx_list = [500, 1000]
     if ts_values is None:
@@ -611,7 +655,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run the requested SER/goodput sweeps.")
     parser.add_argument("--trials", type=int, default=10, help="Monte Carlo trials per point (default: 10)")
-    parser.add_argument("--symbols", type=int, default=100, help="modulation symbols per trial (default: 100)")
+    parser.add_argument("--symbols", type=int, default=200, help="modulation symbols per trial (default: 200; 10 trials pool 2000 symbols)")
     parser.add_argument("--templates", default="100", help="templates per N_Tx, or 'auto' to reuse all consecutive existing files")
     parser.add_argument("--ts-n-tx", type=int, default=500, help="fixed N_Tx for the Ts sweep (default: 500)")
     parser.add_argument("--ts-values", default="0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0",

@@ -13,6 +13,7 @@ from scipy.optimize import linear_sum_assignment
 
 from config import R0, RR, D, SMOOTHING_WINDOW
 from utils.signal import moving_average, adaptive_smoothing_window
+from detection.slot_scoring import slot_scores
 
 
 def robust_decode(molecule_signals, bit_sequence, dt_bin, num_molecule_types,
@@ -52,23 +53,20 @@ def robust_decode(molecule_signals, bit_sequence, dt_bin, num_molecule_types,
         for slot_idx in range(num_molecule_types):
             expected_peak_t = (symbol_start_t + slot_idx * delay_between_molecules
                                + t_peak_theory)
-            idx_start = max(0, int((expected_peak_t - half_window) / dt_bin))
-            idx_end = min(smoothed_signals.shape[1],
-                          int(np.ceil((expected_peak_t + half_window) / dt_bin)) + 1)
-            if idx_end <= idx_start:
-                continue
-
+            rises = slot_scores(smoothed_signals, expected_peak_t, half_window,
+                                dt_bin, delay_between_molecules)
             for m_type in range(num_molecule_types):
+                # Keep the local peak time for diagnostics; assignment uses
+                # the same valley-subtracted rise as the other decoders.
+                idx_start = max(0, int((expected_peak_t - half_window) / dt_bin))
+                idx_end = min(smoothed_signals.shape[1],
+                              int(np.ceil((expected_peak_t + half_window) / dt_bin)) + 1)
                 window_data = smoothed_signals[m_type, idx_start:idx_end]
                 if not len(window_data):
                     continue
                 local_peak_idx = int(np.argmax(window_data))
                 peak_idx = idx_start + local_peak_idx
-                # Compare local rise over the pre-slot level to reduce the
-                # influence of a previous symbol's slowly decaying tail.
-                baseline_idx = max(0, idx_start - max(1, int(half_window / dt_bin)))
-                baseline = float(smoothed_signals[m_type, baseline_idx])
-                score_matrix[slot_idx, m_type] = float(window_data[local_peak_idx]) - baseline
+                score_matrix[slot_idx, m_type] = rises[m_type]
                 peak_indices[slot_idx, m_type] = peak_idx
 
         # Assign all molecule types to all slots jointly. Greedy per-slot picks

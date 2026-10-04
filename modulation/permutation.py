@@ -26,6 +26,7 @@ def generate_bit_sequence_transmission(
     delay_between_symbols=2.5,
     delay_between_molecules=0.4,
     plot=True,
+    save_signal=True,
 ):
     """
     Full permutation scheme pipeline: encode → transmit → decode → compare.
@@ -165,7 +166,8 @@ def generate_bit_sequence_transmission(
 
     # ── Save CSV ─────────────────────────────────────────────────────────
     output_file = os.path.join(exp_path, "combined_bit_sequence_signal.csv")
-    save_signal_csv(combined_signal, time_axis, molecule_signals,
-                    molecule_names, output_file)
+    if save_signal:
+        save_signal_csv(combined_signal, time_axis, molecule_signals,
+                        molecule_names, output_file)
 
     return combined_signal, time_axis, symbol_transmissions, molecule_signals, decoded_symbols

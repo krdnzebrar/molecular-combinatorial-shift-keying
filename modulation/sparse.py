@@ -16,7 +16,10 @@ import matplotlib.pyplot as plt
 from config import DT, R0, RR, D, CUSTOM_DIR, SMOOTHING_WINDOW
 from utils.signal import moving_average, adaptive_smoothing_window
 from modulation.encoder import build_signal, save_signal_csv
-from detection.sparse_decoder import calibrate_sparse_threshold, decode_sparse_fixed
+from detection.sparse_decoder import decode_sparse_fixed
+from detection.channel_threshold import expected_pulse_threshold
+from modulation.alphabet import sample_sparse_pattern
+from detection.slot_scoring import slot_scores
 
 
 def generate_sparse_bit_sequence_transmission(
@@ -28,6 +31,7 @@ def generate_sparse_bit_sequence_transmission(
     delay_between_symbols=2.5,
     delay_between_molecules=0.4,
     plot=True,
+    save_signal=True,
 ):
     """
     Full sparse pattern pipeline: encode → transmit → decode → compare.
@@ -42,12 +46,9 @@ def generate_sparse_bit_sequence_transmission(
     molecule_names = [chr(65 + i) for i in range(num_molecule_types)]
     # The full sparse alphabet grows super-exponentially. Sample uniformly
     # from its members without constructing every pattern.
-    pattern_counts = [
-        math.comb(num_molecule_types, active) ** 2
-        * math.factorial(active)
-        for active in range(num_molecule_types + 1)
-    ]
-    pattern_count = sum(pattern_counts)
+    pattern_count = sum(
+        math.comb(num_molecule_types, active) ** 2 * math.factorial(active)
+        for active in range(num_molecule_types + 1))
     print(f"Total sparse patterns available : {pattern_count}")
     print(f"Bit sequence length             : {len(bit_sequence)}")
     print(f"Number of '1's                  : {bit_sequence.count('1')}\n")
@@ -56,17 +57,7 @@ def generate_sparse_bit_sequence_transmission(
     symbol_transmissions = []
     for bit_idx, bit in enumerate(bit_sequence):
         if bit == '1':
-            active_count = int(np.random.choice(
-                np.arange(num_molecule_types + 1),
-                p=np.asarray(pattern_counts, dtype=float) / pattern_count,
-            ))
-            pattern = [None] * num_molecule_types
-            if active_count:
-                slots = np.random.choice(num_molecule_types, size=active_count, replace=False)
-                molecules = np.random.choice(num_molecule_types, size=active_count, replace=False)
-                for slot, molecule in zip(slots, molecules):
-                    pattern[int(slot)] = int(molecule)
-            pattern = tuple(pattern)
+            pattern = sample_sparse_pattern(num_molecule_types)
             pattern_string = ''.join(molecule_names[m] if m is not None else '_' for m in pattern)
             symbol_transmissions.append({
                 'bit_position': bit_idx,
@@ -91,11 +82,9 @@ def generate_sparse_bit_sequence_transmission(
     for i in range(num_molecule_types):
         smoothed_signals[i] = moving_average(molecule_signals[i], smooth_window)
 
-    # ── Calibrate fixed threshold ────────────────────────────────────────
-    fixed_threshold, mean_present, mean_absent = calibrate_sparse_threshold(
-        smoothed_signals, symbol_transmissions, dt_bin,
-        num_molecule_types, delay_between_symbols, delay_between_molecules,
-    )
+    # ── Calibrate from unlabeled single-pulse channel templates ──────────
+    fixed_threshold = expected_pulse_threshold(
+        exp_path, normalization, dt_bin, smooth_window)
 
     # ── Decoding ─────────────────────────────────────────────────────────
     print("=== DECODING WITH FIXED THRESHOLD + MOLECULE EXCLUSION ===")
@@ -103,7 +92,6 @@ def generate_sparse_bit_sequence_transmission(
         molecule_signals, bit_sequence, dt_bin,
         num_molecule_types, molecule_names,
         delay_between_symbols, delay_between_molecules,
-        None, None,
         fixed_threshold,
     )
 
@@ -180,19 +168,13 @@ def generate_sparse_bit_sequence_transmission(
                     continue
                 slot_send_t = symbol_start + slot_idx * delay_between_molecules
                 peak_center = slot_send_t + t_peak_theory
-                s = max(int((peak_center - half_w) / dt_bin), 0)
-                e = min(int((peak_center + half_w) / dt_bin),
-                        smoothed_signals.shape[1] - 1)
-                if s >= e:
-                    continue
-                for m in range(num_molecule_types):
-                    baseline_idx = max(0, s - max(1, int(half_w / dt_bin)))
-                    peak = max(float(np.max(smoothed_signals[m, s:e]))
-                               - float(smoothed_signals[m, baseline_idx]), 0.0)
+                rises = slot_scores(smoothed_signals, peak_center, half_w,
+                                    dt_bin, delay_between_molecules)
+                for m, peak in enumerate(rises):
                     if m == sent_mol:
-                        all_present.append(peak)
+                        all_present.append(float(peak))
                     else:
-                        all_absent.append(peak)
+                        all_absent.append(float(peak))
 
         plt.scatter(range(len(all_present)), all_present, s=10, color='green',
                     alpha=0.6, label='Present channel peaks')
@@ -209,7 +191,8 @@ def generate_sparse_bit_sequence_transmission(
 
     # ── Save CSV ─────────────────────────────────────────────────────────
     output_file = os.path.join(exp_path, "combined_bit_sequence_signal.csv")
-    save_signal_csv(combined_signal, time_axis, molecule_signals,
-                    molecule_names, output_file)
+    if save_signal:
+        save_signal_csv(combined_signal, time_axis, molecule_signals,
+                        molecule_names, output_file)
 
     return combined_signal, time_axis, symbol_transmissions, molecule_signals, decoded_symbols

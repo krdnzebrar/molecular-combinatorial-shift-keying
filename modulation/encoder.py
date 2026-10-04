@@ -63,6 +63,7 @@ def build_signal(
     combined_signal = np.zeros(num_bins)
     molecule_signals = np.zeros((num_molecule_types, num_bins))
     time_axis = np.arange(num_bins) * dt_bin
+    template_cache = {}
 
     print("\n=== Processing Transmissions ===")
     for sym_idx, symbol in enumerate(symbol_transmissions):
@@ -83,7 +84,9 @@ def build_signal(
                 print(f"  Warning: {exp_file} not found, skipping")
                 continue
 
-            time_data, hits_data = load_experiment_data(exp_file, normalization)
+            if exp_id not in template_cache:
+                template_cache[exp_id] = load_experiment_data(exp_file, normalization)
+            time_data, hits_data = template_cache[exp_id]
             total_delay = symbol_start + slot_idx * delay_between_molecules
 
             print(f"  Slot {slot_idx}: Molecule {molecule_names[molecule_type]} "

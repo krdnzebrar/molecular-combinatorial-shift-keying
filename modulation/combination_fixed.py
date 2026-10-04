@@ -4,7 +4,7 @@ modulation/combination_fixed.py
 MoCSK ordered-subset scheme with an unlabeled global threshold.
 
 Each active interval carries a uniformly sampled ordered subset, including
-the empty symbol. The threshold is estimated from observed slot-rise scores.
+the empty symbol. The threshold comes from the expected channel pulse response.
 """
 
 import os
@@ -17,9 +17,9 @@ from utils.signal import moving_average, adaptive_smoothing_window
 from modulation.alphabet import sample_ordered_subset
 from modulation.encoder import build_signal, save_signal_csv
 from detection.threshold_decoder import (
-    calibrate_fixed_threshold,
     decode_combinations_fixed,
 )
+from detection.channel_threshold import expected_pulse_threshold
 
 
 def generate_combination_transmission(
@@ -31,6 +31,7 @@ def generate_combination_transmission(
     delay_between_symbols=2.5,
     delay_between_molecules=0.4,
     plot=True,
+    save_signal=True,
 ):
     """
     Full combination (fixed threshold) pipeline.
@@ -81,10 +82,8 @@ def generate_combination_transmission(
         smoothed_signals[i] = moving_average(molecule_signals[i], smooth_window)
 
     # ── Calibrate fixed threshold ────────────────────────────────────────
-    fixed_threshold = calibrate_fixed_threshold(
-        smoothed_signals, symbol_transmissions, dt_bin,
-        num_molecule_types, delay_between_symbols, delay_between_molecules,
-    )
+    fixed_threshold = expected_pulse_threshold(
+        exp_path, normalization, dt_bin, smooth_window)
 
     # ── Decoding ─────────────────────────────────────────────────────────
     print("=== DECODING WITH FIXED THRESHOLD ===")
@@ -92,7 +91,6 @@ def generate_combination_transmission(
         molecule_signals, bit_sequence, dt_bin,
         num_molecule_types, molecule_names,
         delay_between_symbols,
-        None, None,
         fixed_threshold,
         delay_between_molecules=delay_between_molecules,
     )
@@ -181,7 +179,8 @@ def generate_combination_transmission(
 
     # ── Save CSV ─────────────────────────────────────────────────────────
     output_file = os.path.join(exp_path, "combined_bit_sequence_signal.csv")
-    save_signal_csv(combined_signal, time_axis, molecule_signals,
-                    molecule_names, output_file)
+    if save_signal:
+        save_signal_csv(combined_signal, time_axis, molecule_signals,
+                        molecule_names, output_file)
 
     return combined_signal, time_axis, symbol_transmissions, molecule_signals, decoded_symbols

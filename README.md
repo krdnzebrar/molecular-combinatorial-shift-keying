@@ -6,7 +6,7 @@ A unified, modular research repository for Molecular Combinatorial Shift Keying 
 
 ## Architecture Overview
 
-All schemes share the same physical constants (`config.py`), signal processing tools (`utils/signal.py`), channel models (`channel/diffusion.py`), and evaluation metrics (`evaluation/metrics.py`). There is **zero duplication** across modules.
+All schemes share the same physical constants (`config.py`), signal processing tools (`utils/signal.py`), channel models (`channel/diffusion.py`), and evaluation metrics (`evaluation/metrics.py`).
 
 ```
 molecular-combinatorial-shift-keying/
@@ -33,14 +33,13 @@ molecular-combinatorial-shift-keying/
 │   ├── alphabet.py                    # Permutations, combinations, sparse patterns
 │   ├── encoder.py                     # Multi-molecule transmission signal builder
 │   ├── permutation.py                 # Permutation MoCSK scheme pipeline
-│   ├── combination_adaptive.py        # Combination MoCSK with adaptive gap threshold
 │   ├── combination_fixed.py           # Combination MoCSK with calibrated fixed threshold
 │   └── sparse.py                      # Sparse pattern MoCSK with molecule exclusion
 │
 ├── detection/
 │   ├── __init__.py
 │   ├── peak_decoder.py                # Smoothed-peak arrival order decoder
-│   ├── threshold_decoder.py           # Adaptive gap and calibrated fixed threshold decoders
+│   ├── threshold_decoder.py           # MoCSK decoder with a calibrated fixed threshold
 │   └── sparse_decoder.py              # Slot-by-slot decoder with molecule lockout
 │
 ├── evaluation/
@@ -64,10 +63,17 @@ molecular-combinatorial-shift-keying/
 
 | Scheme | Carrier Symbol | Detection Mechanism | Key Strength |
 |---|---|---|---|
-| **Permutation MoCSK** (`permutation.py`) | Full permutation of $K$ molecule types | Smoothed peak arrival order (`peak_decoder.py`) | High symbol entropy without requiring threshold calibration |
-| **Combination MoCSK (Adaptive)** (`combination_adaptive.py`) | Subset of $K$ molecule alphabet | Dynamic threshold at largest inter-peak gap (`threshold_decoder.py`) | Self-adjusting to fluctuating channel conditions |
-| **Combination MoCSK (Fixed)** (`combination_fixed.py`) | Subset of $K$ molecule alphabet | Calibrated global threshold: $\mu_{\text{absent}} + 0.30(\mu_{\text{present}} - \mu_{\text{absent}})$ | Prevents false positives caused by ISI tails across symbols |
-| **Sparse Pattern MoCSK** (`sparse.py`) | Partial slot fill with molecule permutation | Slot-by-slot detection with molecule exclusion (`sparse_decoder.py`) | Eliminates tail re-detection; robust at high symbol rates |
+| **Permutation MoCSK** (`permutation.py`) | Full permutation of $K$ molecule types | Joint assignment of molecule channels to release slots using local peak rises | Preserves release order |
+| **MoCSK** (`combination_fixed.py`) | Ordered subset in the first $k$ slots, including the empty symbol | Joint assignment to slots using local peak rises and a channel-derived threshold | Supports variable-length ordered subsets |
+| **E-MoCSK** (`sparse.py`) | Sparse slot and molecule patterns, including the all-empty symbol | Joint assignment with molecule columns and empty-slot dummy columns | Supports sparse patterns |
+
+All three moving-average decoders use a shared local-rise score. The expected
+channel peak response locates each slot window. The baseline is the minimum
+smoothed signal in a window ending half a slot before that peak, and the
+decision threshold is one half of the isolated-pulse channel peak. This
+detector is limited when $\Delta=T_s/K$ is shorter than the pulse width because
+adjacent pulses overlap; the discrete maximum-likelihood detector is intended
+to address that regime and is not yet implemented here.
 
 ---
 
@@ -120,14 +126,15 @@ res_combo = run_combination_fixed(
 ```bash
 python -m experiments.sweep
 ```
-This runs the requested two families of plots for $K=2,\ldots,10$ comparing all four implemented schemes:
+This runs the requested two families of plots for $K=2,\ldots,10$ comparing the three implemented schemes:
 
 - **SER and goodput vs. $T_s$:** $T_s=0.2,0.3,\ldots,1.0$ s for every $K=2,\ldots,10$, with $N_{\text{Tx}}=500$ held fixed.
-- **SER and goodput vs. $N_{\text{Tx}}$:** $N_{\text{Tx}}=100,200,\ldots,1000$, with $T_s=1/K$ for each $K$.
+- **SER and BER-approximate goodput vs. $N_{\text{Tx}}$:** $N_{\text{Tx}}=100,200,\ldots,1000$, with $T_s=1.0$ s for every $K$.
 - For the sweeps, releases use uniform spacing $\Delta=T_s/K$, including across consecutive symbols; moving-average width shrinks when slots are close. The receiver decodes with the expected channel peak delay, so decisions can use a short look-ahead into the next interval.
 - Pools symbol errors across Monte Carlo trials and calculates 95% Wilson intervals.
-- The sweep transmits one modulation symbol in every symbol period, with the empty symbol represented explicitly in the MoCSK/E-MoCSK alphabets. Goodput is $(1-\mathrm{SER})\log_2(M)/T_s$ bits/s. It is a SER-based estimate, not a BER measurement.
-- Saves each vector PDF to `results/figures/ser_goodput_vs_ts.pdf` and `results/figures/ser_goodput_vs_n_tx.pdf`. Each PDF has a SER page and a SER-based goodput page, with one panel per molecule count so methods can be compared without overlaying all $K$ values. Pooled point-by-point data and confidence intervals are saved to `results/sweep_results.csv`.
+- The sweep transmits one modulation symbol in every symbol period, with the empty symbol represented explicitly in the MoCSK/E-MoCSK alphabets. It reports SER and uses the uniform-symbol-error BER approximation for the BER-approximate goodput.
+- The `ber_approx` CSV field and `goodput_bits_per_second` use the uniform-symbol-error formula; they are estimates, not bitwise BER measurements.
+- Saves each vector PDF to `results/figures/ser_goodput_vs_ts.pdf` and `results/figures/ser_goodput_vs_n_tx.pdf`. Each PDF has a SER page and a BER-approximate goodput page, with one panel per molecule count. Pooled point-by-point data and confidence intervals are saved to `results/sweep_results.csv`.
 
 For a quicker exploratory run, lower the trial, sequence, and template counts:
 ```bash
@@ -140,4 +147,50 @@ python -m experiments.sweep --exp-root "../modulation_research/netlab/custom" --
 ```
 Reuse-only mode fails instead of silently generating templates if a requested folder is missing or has too few CSV files. Existing folders contain channel templates, not precomputed SER/goodput points, so the modulation and decoding trials still need to run before the PDFs and summary CSV can be plotted.
 
-The default full run can take a long time because it covers many configurations. The permutation and sparse encoders sample directly from their alphabets rather than materializing every possible symbol. The project still does not implement the paper's discrete maximum-likelihood detector or BER-based goodput; the plots compare the four existing moving-average/threshold-based scheme implementations and use SER-based goodput.
+The default full run can take a long time because it covers many configurations. The permutation, MoCSK, and sparse encoders sample directly from their alphabets rather than materializing every possible symbol. MoSK, BCSK, and the paper's discrete maximum-likelihood detector are not implemented yet.
+
+### Progressive validation
+
+Run the checks from cheapest to most expensive. These use the standard library's
+`unittest`, so pytest is not required.
+
+1. Alphabet sizes, exact bit counts, and K=3 sampler uniformity:
+
+   ```bash
+   .venv/bin/python -m unittest tests.test_alphabet -v
+   ```
+
+2. Noise-free decoder grid using the mean of 100 N1000 channel templates. It
+   covers K=2..10 and Ts=0.2..1.0 and prints one SER grid per scheme:
+
+   ```bash
+   .venv/bin/python -m unittest tests.test_noise_free -v
+   ```
+
+3. For a smaller noisy-channel smoke run before the full regression, use
+   `--molecule-types 5 --n-tx-values 500 --ts-values 0.6,0.8,1.0 --trials 1 --symbols 500 --reuse-only`.
+   Then raise trials and symbols to at least 10 × 200 (2,000 symbols per point)
+   before interpreting sub-1% SER. Use `--exp-root` if templates are outside
+   `../custom`.
+
+   For the fixed-seed K=5 noisy regression, threshold-fraction ablation, and
+   slot-0 miss-rate split, run:
+
+   ```bash
+   .venv/bin/python -m unittest tests.test_noisy_regression -v
+   ```
+
+4. After generating a sweep with the current code, validate its CSV and
+   metadata:
+
+   ```bash
+   .venv/bin/python -m unittest tests.test_saved_results -v
+   ```
+
+   It checks the current valley-scoring metadata, expected row count, complete
+   pooled symbol counts, finite fields, and reports adjacent points with
+   non-overlapping Wilson intervals. Older CSVs and logs should be regenerated.
+
+5. Scale up only after these pass: start with K=2,5,10; Ts=0.2,0.6,1.0;
+   N_Tx=100,500,1000; and 2 trials × 50 symbols. Then run the full grid. Keep
+   the result metadata and detail log with the generated CSV and PDFs.

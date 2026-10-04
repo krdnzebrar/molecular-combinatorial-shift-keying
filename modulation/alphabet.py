@@ -62,6 +62,24 @@ def sample_ordered_subset(num_molecule_types):
     return tuple(int(m) for m in np.random.permutation(k)[:size])
 
 
+def sample_sparse_pattern(num_molecule_types):
+    """Uniformly sample an E-MoCSK pattern of K slots and distinct molecules."""
+    k = int(num_molecule_types)
+    active_counts = np.arange(k + 1)
+    pattern_counts = np.asarray([
+        math.comb(k, active) ** 2 * math.factorial(active)
+        for active in active_counts
+    ], dtype=float)
+    active = int(np.random.choice(active_counts, p=pattern_counts / pattern_counts.sum()))
+    pattern = [None] * k
+    if active:
+        slots = np.random.choice(k, size=active, replace=False)
+        molecules = np.random.choice(k, size=active, replace=False)
+        for slot, molecule in zip(slots, molecules):
+            pattern[int(slot)] = int(molecule)
+    return tuple(pattern)
+
+
 def get_all_sparse_patterns(num_molecule_types):
     """
     All sparse patterns: partial slot fills with permutations.
